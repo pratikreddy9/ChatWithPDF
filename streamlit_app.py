@@ -1,144 +1,124 @@
 import streamlit as st
 import os
 from PyPDF2 import PdfReader
-import google.generativeai as genai
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain.vectorstores import FAISS
-from langchain.prompts import PromptTemplate
-from langchain.chains.question_answering import load_qa_chain
+from google.generativeai import configure, generate_embeddings, chat
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 from dotenv import load_dotenv
 from io import BytesIO
 
-st.set_page_config(page_title="Chat With One or More PDFs")
+# Configure Google Generative AI
+GOOGLE_API_KEY = "your_google_api_key_here"  # Replace with your actual API key
+configure(api_key=GOOGLE_API_KEY)
 
-load_dotenv()
+st.set_page_config(page_title="Chat With PDFs")
 
-genai.configure(api_key=os.getenv("Google_API_KEY"))
-
-def getPdfText(pdf_docs):
+# Function to extract text from PDFs
+def get_pdf_text(pdf_docs):
     text = ""
     for pdf in pdf_docs:
         try:
             pdf_reader = PdfReader(BytesIO(pdf.read()))
             for page in pdf_reader.pages:
                 page_text = page.extract_text() or ""
-                st.write(f"Extracted text: {page_text[:500]}")  # Show the first 500 characters for inspection
                 text += page_text
         except Exception as e:
             st.error(f"Error reading PDF: {e}")
     return text
 
-
-# def getPdfText(pdf_docs):
-#     text = ""
-#     for pdf in pdf_docs:
-#         try:
-#             pdf_reader = PdfReader(BytesIO(pdf.read()))  # Read the content as bytes and wrap it in BytesIO
-#             for page in pdf_reader.pages:
-#                 text += page.extract_text() or ""
-#         except Exception as e:
-#             st.error(f"Error reading PDF: {e}")
-#     return text
-
-def getTextChunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = text_splitter.split_text(text)
+# Function to split text into manageable chunks
+def split_text_into_chunks(text, chunk_size=1000, overlap=200):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - overlap
     return chunks
 
-def get_vector_store(text_chunks):
-    # embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding")
-    # embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-1.5-flash-latest")
-    # embeddings = GoogleGenerativeAIEmbeddings(model="gemini-1.5-flash-latest")/
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+# Generate embeddings for text chunks
+def generate_text_embeddings(chunks):
+    embeddings = []
+    for chunk in chunks:
+        try:
+            embedding = generate_embeddings(chunk)["embeddings"]
+            embeddings.append(embedding)
+        except Exception as e:
+            st.error(f"Error generating embeddings: {e}")
+    return embeddings
 
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index")
-    return vector_store
+# Save embeddings and chunks for later use
+def save_embeddings(chunks, embeddings):
+    np.save("text_chunks.npy", chunks)
+    np.save("text_embeddings.npy", embeddings)
 
-def get_conversational_chain():
-    Prompt_Template = """ 
-Answer the question as detailed as possible based on the provided context. If the context does not contain the information, simply respond with "You're Stupid & Answer not available in the context". Do not fabricate an answer.\n\n
-Context:\n {context}\n
-Question: \n{question}\n
-Answer:
-"""
-
-#     Prompt_Template = """ 
-#     Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
-#     provided context just say, "You're Stupid! answer is not available in the context", don't provide the wrong answer\n\n
-#     Context:\n {context}?\n
-#     Question: \n{question}\n
-
-#     Answer:
-# """ 
-    # model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.3)
-    # model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.3)
-    model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.3)
-
-    prompt = PromptTemplate(template=Prompt_Template, input_variables=["context", "question"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-    return chain
-
-def user_input(user_question):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+# Load embeddings and chunks
+def load_embeddings():
     try:
-        new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-        docs = new_db.similarity_search(user_question)
-        chain = get_conversational_chain()
-        response = chain(
-            {
-                "input_documents": docs, "question": user_question
-            }, return_only_outputs=True)
-        st.write("Response:", response)  # Print the entire response object
-        st.write("Reply: ", response.get("output_text", "No output text found"))
-    except ValueError as e:
-        st.error(f"Error loading FAISS index: {e}")
+        chunks = np.load("text_chunks.npy", allow_pickle=True)
+        embeddings = np.load("text_embeddings.npy", allow_pickle=True)
+        return chunks, embeddings
+    except FileNotFoundError:
+        st.error("No embeddings found. Please process PDFs first.")
+        return None, None
+
+# Find the most similar chunk to the query
+def find_similar_chunks(query_embedding, embeddings, top_k=3):
+    similarities = cosine_similarity([query_embedding], embeddings)[0]
+    top_indices = similarities.argsort()[-top_k:][::-1]
+    return top_indices, similarities[top_indices]
+
+# Generate a response using Google Generative AI
+def generate_response(context, question):
+    prompt = f"""
+    Answer the question as detailed as possible based on the provided context. 
+    If the context does not contain the information, respond with "Answer not available in the context."
+    
+    Context: {context}
+    Question: {question}
+    Answer:
+    """
+    try:
+        response = chat(prompt, temperature=0.3)
+        return response["text"]
     except Exception as e:
-        st.error(f"Unexpected error: {e}")
+        st.error(f"Error generating response: {e}")
+        return "Error generating response."
 
-
-# def user_input(user_question):
-#     # embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-1.5-flash-latest")
-#     embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
-#     try:
-#         new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-#         docs = new_db.similarity_search(user_question)
-#         chain = get_conversational_chain()
-#         response = chain(
-#             {
-#                 "input_documents": docs, "question": user_question
-#             }, return_only_outputs=True)
-#         st.write("Reply: ", response["output_text"])
-#     except ValueError as e:
-#         st.error(f"Error loading FAISS index: {e}")
-#     except GoogleGenerativeAIError as e:
-#         st.error(f"Error with Google Generative AI: {e}")
-#     except Exception as e:
-#         st.error(f"Unexpected error: {e}")
-
+# Main Streamlit app logic
 def main():
-    st.title("Chat with Pdf")
-    st.header("Chat with PDF using Gemini Pro!!")
-    user_question = st.text_input("Ask question from the PDF files")
+    st.title("Chat with PDFs")
+    st.header("Chat with your uploaded PDF files")
+    
+    user_question = st.text_input("Ask a question about the PDFs:")
     if user_question:
-        user_input(user_question)
-
+        chunks, embeddings = load_embeddings()
+        if chunks is not None and embeddings is not None:
+            try:
+                query_embedding = generate_embeddings(user_question)["embeddings"]
+                top_indices, _ = find_similar_chunks(query_embedding, embeddings)
+                context = " ".join([chunks[i] for i in top_indices])
+                response = generate_response(context, user_question)
+                st.write("Response:", response)
+            except Exception as e:
+                st.error(f"Error processing question: {e}")
+    
     with st.sidebar:
         st.title("Menu")
-        pdf_docs = st.file_uploader("Upload your PDF files and Submit", type="pdf", accept_multiple_files=True)
-        if st.button("Submit & Process"):
-            with st.spinner("Processing..."):
-                if pdf_docs:
+        pdf_docs = st.file_uploader("Upload your PDF files", type="pdf", accept_multiple_files=True)
+        if st.button("Process PDFs"):
+            if pdf_docs:
+                with st.spinner("Processing..."):
                     try:
-                        raw_text = getPdfText(pdf_docs)
-                        text_chunks = getTextChunks(raw_text)
-                        get_vector_store(text_chunks)
-                        st.success("Done!")
+                        raw_text = get_pdf_text(pdf_docs)
+                        chunks = split_text_into_chunks(raw_text)
+                        embeddings = generate_text_embeddings(chunks)
+                        save_embeddings(chunks, embeddings)
+                        st.success("PDFs processed and embeddings saved!")
                     except Exception as e:
-                        st.error(f"Processing error: {e}")
-                else:
-                    st.error("Please upload at least one PDF file.")
+                        st.error(f"Error processing PDFs: {e}")
+            else:
+                st.error("Please upload at least one PDF file.")
 
 if __name__ == "__main__":
     main()
